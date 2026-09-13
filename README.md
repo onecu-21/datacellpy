@@ -8,13 +8,19 @@ Register cells, seal their definitions with `endof()`, and call `run()`. The run
 
 Python 3.10 or later is required. The runtime has no external dependencies.
 
-Install from the project directory:
+Install from PyPI:
 
 ```sh
 pip install datacellpy
 ```
 
-The distribution name and Python import name are both `datacellpy`. This project has not been published to a package registry.
+For development, install from the project directory:
+
+```sh
+python -m pip install -e .
+```
+
+The distribution name and Python import name are both `datacellpy`.
 
 On Windows, `run.ps1` locates an available Python interpreter, including the bundled Codex Python when available. Run `.\run.ps1` without arguments to display usage, or pass Python arguments to the script.
 
