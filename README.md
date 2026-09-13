@@ -112,6 +112,10 @@ Importing the same library in multiple modules normally reuses Python's cached m
 
 DataCellPy does not remove CPython's GIL. Threads can help with I/O waits, but they do not automatically speed up CPU-bound pure Python code. Version 1.0.0 does not provide JIT compilation, a process pool, caching between runs, or automatic retries.
 
+## Support
+
+Report bugs and request features through [GitHub Issues](https://github.com/onecu-21/datacellpy/issues). Include your Python version, operating system, a minimal reproduction, and any relevant error output when reporting a bug.
+
 ## Project files and tests
 
 - `datacellpy/`: cell registration, dependency planning, and execution runtime.

@@ -12,6 +12,7 @@ dependencies = []
 
 [project.urls]
 Repository = "https://github.com/onecu-21/datacellpy"
+Issues = "https://github.com/onecu-21/datacellpy/issues"
 
 [tool.setuptools]
 packages = ["datacellpy"]
