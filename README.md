@@ -11,7 +11,7 @@ Python 3.10 or later is required. The runtime has no external dependencies.
 Install from the project directory:
 
 ```sh
-python -m pip install -e .
+pip install datacellpy
 ```
 
 The distribution name and Python import name are both `datacellpy`. This project has not been published to a package registry.
