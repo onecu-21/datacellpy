@@ -1,5 +1,9 @@
 # DataCellPy
 
+[![PyPI](https://img.shields.io/pypi/v/datacellpy.svg)](https://pypi.org/project/datacellpy/)
+[![Python](https://img.shields.io/pypi/pyversions/datacellpy.svg)](https://pypi.org/project/datacellpy/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 DataCellPy is a small Python runtime that registers functions as **cells** and executes them according to explicit data dependencies. It uses ordinary Python code and libraries without a separate language syntax or parser.
 
 Register cells, seal their definitions with `endof()`, and call `run()`. The runtime executes only the requested targets and their dependencies. Independent cells can run concurrently.
