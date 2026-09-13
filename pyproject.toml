@@ -9,6 +9,7 @@ description = "A dependency-driven dataflow runtime for Python"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+license = "Apache-2.0"
 
 [project.urls]
 Repository = "https://github.com/onecu-21/datacellpy"
