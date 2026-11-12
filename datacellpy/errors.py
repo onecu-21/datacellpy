@@ -31,6 +31,10 @@ class InputError(CellError):
     """Run inputs cannot satisfy the selected cells' function signatures."""
 
 
+class ResourceError(CellError):
+    """A cell requests an undeclared resource or more than the run's capacity."""
+
+
 class CellExecutionError(CellError):
     def __init__(self, cell_name: str, cause: Exception):
         self.cell_name = cell_name

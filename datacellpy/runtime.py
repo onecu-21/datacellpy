@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from functools import partial
 import html
 import inspect
 import json
@@ -17,8 +14,9 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
+from ._scheduler import Execution, resource_units
 from .errors import (
-    CellExecutionError, CycleError, DefinitionError, InputError,
+    CycleError, DefinitionError, InputError,
     ResultUnavailableError, UnknownCellError, UnsealedCellError,
 )
 
@@ -33,6 +31,8 @@ class _Cell:
     signature: inspect.Signature
     bindings: tuple[tuple[str, str], ...]
     sealed: bool = False
+    cache: bool = True
+    resources: tuple[tuple[str, int], ...] = ()
 
     @property
     def needs(self) -> tuple[str, ...]:
@@ -70,15 +70,25 @@ class ExecutionPlan:
 
 
 class Runtime:
-    """An isolated cell registry and scheduler, with no cache between runs."""
+    """An isolated registry with optional incremental, resource-aware execution."""
 
-    def __init__(self, max_workers: int = 8):
+    def __init__(self, max_workers: int = 8, *, incremental: bool = False,
+                 resources: Mapping[str, int] | None = None):
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
         self.max_workers = max_workers
+        if not isinstance(incremental, bool):
+            raise ValueError("incremental must be a boolean")
+        self.incremental = incremental
+        self.resources = MappingProxyType(dict(resource_units(resources)))
         self._cells: dict[str, _Cell] = {}
         self._lock = RLock()
         self._generation = 0
+        self._cache: dict[str, Any] = {}
+        self._cache_epoch = 0
+        self._execution: ContextVar[tuple[Execution, str] | None] = ContextVar(
+            f"datacellpy_execution_{id(self)}", default=None
+        )
         self._last: ContextVar[tuple[int, Mapping[str, Any]] | None] = ContextVar(
             f"datacellpy_results_{id(self)}", default=None
         )
@@ -89,9 +99,7 @@ class Runtime:
             raise DefinitionError("Cell names must be non-empty strings.")
         return name
 
-    def cell(self, name: str, need: Need = None):
-        """Register a function without running it; close it with endof()."""
-        name = self._name(name)
+    def _bindings(self, need: Need):
         explicit_aliases = isinstance(need, Mapping)
         if need is None:
             bindings = ()
@@ -112,6 +120,31 @@ class Runtime:
             for source in needs:
                 self._name(source)
             bindings = tuple((source, source) for source in dict.fromkeys(needs))
+        return bindings
+
+    @staticmethod
+    def _check_aliases(name, signature, bindings):
+        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in signature.parameters.values())
+        named = {
+            p.name for p in signature.parameters.values()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+        if not accepts_kwargs:
+            unmatched = [alias for alias, _ in bindings if alias not in named]
+            if unmatched:
+                raise DefinitionError(f"Cell {name!r} has no parameters for aliases: {', '.join(unmatched)}")
+
+    def cell(self, name: str, need: Need = None, *, cache: bool = True,
+             resources: Mapping[str, int] | None = None):
+        """Register a function; optionally declare cache policy and resource units."""
+        name = self._name(name)
+        bindings = self._bindings(need)
+        if not isinstance(cache, bool):
+            raise DefinitionError("cache must be a boolean")
+        try:
+            demands = resource_units(resources)
+        except ValueError as exc:
+            raise DefinitionError(str(exc)) from exc
 
         def decorate(function):
             if not callable(function):
@@ -124,16 +157,9 @@ class Runtime:
                 raise DefinitionError(f"Cannot inspect cell {name!r}: {exc}") from exc
             if any(p.kind == p.POSITIONAL_ONLY for p in signature.parameters.values()):
                 raise DefinitionError(f"Cell {name!r} must use named parameters (no positional-only parameters).")
-            accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in signature.parameters.values())
-            named = {
-                p.name for p in signature.parameters.values()
-                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-            }
-            if explicit_aliases and not accepts_kwargs:
-                unmatched = [alias for alias, _ in bindings if alias not in named]
-                if unmatched:
-                    raise DefinitionError(f"Cell {name!r} has no parameters for aliases: {', '.join(unmatched)}")
-            definition = _Cell(name, function, signature, bindings)
+            if isinstance(need, Mapping):
+                self._check_aliases(name, signature, bindings)
+            definition = _Cell(name, function, signature, bindings, cache=cache, resources=demands)
             with self._lock:
                 self._cells[name] = definition
                 self._generation += 1
@@ -155,11 +181,64 @@ class Runtime:
 
     eo = endof
 
+    def set_dependencies(self, name: str, need: Need = None) -> None:
+        """Atomically replace a sealed cell's static edges for subsequent runs."""
+        name = self._name(name)
+        bindings = self._bindings(need)
+        with self._lock:
+            if name not in self._cells:
+                raise UnknownCellError(name)
+            original = self._cells[name]
+            if not original.sealed:
+                raise UnsealedCellError(name)
+            if isinstance(need, Mapping):
+                self._check_aliases(name, original.signature, bindings)
+            candidate = {**self._cells, name: replace(original, bindings=bindings)}
+            self._compile(candidate, name, self._generation)
+            self._cells[name] = candidate[name]
+            self._generation += 1
+
+    async def require(self, target: Target, /):
+        """Discover dependencies from inside an executing asynchronous cell."""
+        current = self._execution.get()
+        if current is None:
+            raise DefinitionError("require() must be awaited inside a running cell.")
+        execution, name = current
+        return await execution.require(name, target)
+
+    def invalidate(self, name: str | None = None) -> None:
+        """Discard cached values for a cell and its descendants, or all cells."""
+        with self._lock:
+            if name is None:
+                self._cache.clear()
+            else:
+                self._name(name)
+                if name not in self._cells:
+                    raise UnknownCellError(name)
+                affected = {name}
+                children = {cell_name: set(definition.needs)
+                            for cell_name, definition in self._cells.items()}
+                for cell_name, entry in self._cache.items():
+                    children.setdefault(cell_name, set()).update(dep for dep, _ in entry.dependencies)
+                changed = True
+                while changed:
+                    descendants = {child for child, deps in children.items() if deps & affected}
+                    changed = not descendants <= affected
+                    affected.update(descendants)
+                for cell_name in affected:
+                    self._cache.pop(cell_name, None)
+            self._cache_epoch += 1
+            self._generation += 1
+        self._last.set(None)
+
     def compile(self, target: Target = None) -> ExecutionPlan:
         """Validate and topologically order only the requested dependency closure."""
         with self._lock:
             cells = self._cells.copy()
             generation = self._generation
+        return self._compile(cells, target, generation)
+
+    def _compile(self, cells, target, generation):
         single = isinstance(target, str)
         if target is None:
             targets = tuple(cells)
@@ -215,7 +294,7 @@ class Runtime:
         return self.compile(target).graph()
 
     @staticmethod
-    def _arguments(plan: ExecutionPlan, inputs: Mapping[str, Any]):
+    def _arguments(plan: ExecutionPlan, inputs: Mapping[str, Any], *, allow_unused=False):
         """Preflight every signature before starting any user function."""
         prepared = {}
         used = set()
@@ -243,80 +322,15 @@ class Runtime:
                 raise InputError(f"Invalid inputs for cell {name!r}: {exc}") from exc
             prepared[name] = (external, injection)
         unknown = set(inputs) - used
-        if unknown:
+        if unknown and not allow_unused:
             raise InputError("Unused run inputs: " + ", ".join(sorted(unknown)))
         return prepared
 
     async def _execute(self, plan: ExecutionPlan, inputs: Mapping[str, Any]):
-        prepared = self._arguments(plan, inputs)
-        results: dict[str, Any] = {}
-        remaining = {name: len(plan.dependencies[name]) for name in plan.order}
-        children: dict[str, list[str]] = {name: [] for name in plan.order}
-        for name in plan.order:
-            for dep in plan.dependencies[name]:
-                children[dep].append(name)
-        ready = deque(name for name in plan.order if remaining[name] == 0)
-        active: dict[asyncio.Task, str] = {}
-        loop = asyncio.get_running_loop()
-        executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="datacellpy")
+        return await Execution(self, plan, inputs).run()
 
-        async def invoke(name):
-            definition = plan._cells[name]
-            external, injection = prepared[name]
-            kwargs = {**external, **{alias: results[source] for alias, source in injection.items()}}
-            try:
-                if inspect.iscoroutinefunction(definition.function):
-                    return await definition.function(**kwargs)
-                context = copy_context()
-                value = await loop.run_in_executor(
-                    executor, context.run, partial(definition.function, **kwargs)
-                )
-                if inspect.isawaitable(value):
-                    return await value
-                return value
-            except Exception as exc:
-                raise CellExecutionError(name, exc) from exc
-
-        try:
-            while ready or active:
-                while ready and len(active) < self.max_workers:
-                    name = ready.popleft()
-                    active[asyncio.create_task(invoke(name), name=f"datacellpy:{name}")] = name
-                done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-                # Check all completions for failure before releasing any descendants.
-                completed = [(task, active[task], task.result()) for task in active if task in done]
-                for task, name, value in completed:
-                    del active[task]
-                    results[name] = value
-                    for child in children[name]:
-                        remaining[child] -= 1
-                        if remaining[child] == 0:
-                            ready.append(child)
-        finally:
-            async def cleanup():
-                for task in active:
-                    task.cancel()
-                if active:
-                    await asyncio.gather(*active, return_exceptions=True)
-                # Python cannot kill a running thread. Drain it without blocking the loop.
-                await loop.run_in_executor(None, partial(executor.shutdown, wait=True, cancel_futures=True))
-
-            cleanup_task = asyncio.create_task(cleanup())
-            cancelled_during_cleanup = False
-            while True:
-                try:
-                    await asyncio.shield(cleanup_task)
-                    break
-                except asyncio.CancelledError:
-                    # Repeated caller cancellation must not abandon running workers.
-                    cancelled_during_cleanup = True
-            if cancelled_during_cleanup:
-                raise asyncio.CancelledError
-        value = results[plan.targets[0]] if plan._single else {name: results[name] for name in plan.targets}
-        return value, MappingProxyType(results)
-
-    def _publish(self, plan, results):
-        self._last.set((plan._generation, results))
+    def _publish(self, generation, results):
+        self._last.set((generation, results))
 
     def run(self, target: Target = None, /, **inputs):
         """Return a value in normal Python; return an awaitable inside an event loop."""
@@ -327,15 +341,15 @@ class Runtime:
         else:
             return self.run_async(target, **inputs)
         plan = self.compile(target)
-        value, results = asyncio.run(self._execute(plan, inputs))
-        self._publish(plan, results)
+        value, results, generation = asyncio.run(self._execute(plan, inputs))
+        self._publish(generation, results)
         return value
 
     async def run_async(self, target: Target = None, /, **inputs):
         """Explicit async entry point, suitable for notebooks and web requests."""
         plan = self.compile(target)
-        value, results = await self._execute(plan, inputs)
-        self._publish(plan, results)
+        value, results, generation = await self._execute(plan, inputs)
+        self._publish(generation, results)
         return value
 
     def result(self, name: str):
@@ -351,5 +365,7 @@ class Runtime:
         """Clear this registry and invalidate all results."""
         with self._lock:
             self._cells.clear()
+            self._cache.clear()
+            self._cache_epoch += 1
             self._generation += 1
         self._last.set(None)

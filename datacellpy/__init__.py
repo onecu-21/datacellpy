@@ -2,7 +2,7 @@
 
 from .errors import (
     CellError, CellExecutionError, CycleError, DefinitionError, InputError,
-    ResultUnavailableError, UnknownCellError, UnsealedCellError,
+    ResourceError, ResultUnavailableError, UnknownCellError, UnsealedCellError,
 )
 from .runtime import ExecutionPlan, Runtime
 
@@ -19,10 +19,14 @@ run = _default.run
 run_async = _default.run_async
 result = _default.result
 reset = _default.reset
+invalidate = _default.invalidate
+require = _default.require
+set_dependencies = _default.set_dependencies
 
 __all__ = [
     "Runtime", "ExecutionPlan", "cell", "c", "endof", "eo", "compile", "graph",
     "run", "run_async", "result", "reset", "CellError", "CellExecutionError",
     "CycleError", "DefinitionError", "InputError", "ResultUnavailableError",
-    "UnknownCellError", "UnsealedCellError", "__version__",
+    "UnknownCellError", "UnsealedCellError", "ResourceError", "invalidate",
+    "require", "set_dependencies", "__version__",
 ]
